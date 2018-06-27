@@ -40,6 +40,9 @@
 /* libsrt defines default packet size as 1316 internally
  * so srt module takes same value. */
 #define SRT_DEFAULT_CHUNK_SIZE 1316
+/* Minimum/Maximum chunks to allow reading at a time from libsrt */
+#define SRT_MIN_CHUNKS_TRYREAD 10
+#define SRT_MAX_CHUNKS_TRYREAD 100
 /* The default timeout is -1 (infinite) */
 #define SRT_DEFAULT_POLL_TIMEOUT -1
 /* The default latency is 125
@@ -64,6 +67,7 @@ typedef struct
     bool        b_interrupted;
     char       *psz_host;
     int         i_port;
+    int         i_chunks;
 } stream_sys_t;
 
 static void srt_wait_interrupted(void *p_data)
@@ -193,6 +197,11 @@ static bool srt_schedule_reconnect(stream_t *p_stream)
         failed = true;
     }
 
+    /* Reset read chunks number because
+     * the stream might have changed
+     */
+    p_sys->i_chunks = SRT_MIN_CHUNKS_TRYREAD;
+
 out:
     if (failed && p_sys->sock != SRT_INVALID_SOCK)
     {
@@ -212,6 +221,7 @@ static block_t *BlockSRT(stream_t *p_stream, bool *restrict eof)
     stream_sys_t *p_sys = p_stream->p_sys;
     int i_chunk_size = var_InheritInteger( p_stream, "chunk-size" );
     int i_poll_timeout = var_InheritInteger( p_stream, "poll-timeout" );
+    VLC_UNUSED(eof);
 
     if ( vlc_killed() )
     {
@@ -219,13 +229,18 @@ static block_t *BlockSRT(stream_t *p_stream, bool *restrict eof)
         return NULL;
     }
 
-    block_t *pkt = block_Alloc( i_chunk_size );
+    size_t i_chunk_size_actual = ( i_chunk_size > 0 )
+        ? i_chunk_size : SRT_DEFAULT_CHUNK_SIZE;
+    int chunks = ( p_sys->i_chunks )
+        ? p_sys->i_chunks : SRT_MIN_CHUNKS_TRYREAD;
+    size_t bufsize = i_chunk_size_actual * chunks;
+    block_t *pkt = block_Alloc( bufsize );
     if ( unlikely( pkt == NULL ) )
     {
         return NULL;
     }
 
-    vlc_interrupt_register( srt_wait_interrupted, p_stream);
+    vlc_interrupt_register( srt_wait_interrupted, p_stream );
 
     SRTSOCKET ready[1];
     int readycnt = 1;
@@ -257,23 +272,41 @@ static block_t *BlockSRT(stream_t *p_stream, bool *restrict eof)
                 continue;
         }
 
-        int stat = srt_recvmsg( p_sys->sock,
-            (char *)pkt->p_buffer, i_chunk_size );
-        if ( stat > 0 )
+        /* Try to read all available data from the lib up to
+         * predefined buffer size. The buffer size can grow over time
+         * up to predefined maximum.
+         */
+        size_t bytesread = 0;
+        while ( (bufsize - bytesread) >= i_chunk_size_actual )
         {
-            pkt->i_buffer = stat;
-            goto out;
+            int stat = srt_recvmsg( p_sys->sock,
+                (char *)( pkt->p_buffer + bytesread ), bufsize - bytesread );
+            if ( stat <= 0 )
+            {
+                break;
+            }
+            bytesread += (size_t)stat;
         }
 
-        msg_Err( p_stream, "failed to receive packet, set EOS (reason: %s)",
-            srt_getlasterror_str() );
-        *eof = true;
-        break;
+        /* Gradually adjust number of chunks we read at a time
+        * up to a predefined maximum. The actual number we might
+        * settle on depends on stream's bit rate.
+        */
+        size_t rem = bufsize - bytesread;
+        if ( rem < i_chunk_size_actual )
+        {
+            if ( ++chunks <= SRT_MAX_CHUNKS_TRYREAD )
+            {
+                p_sys->i_chunks = chunks;
+            }
+        }
+
+        pkt->i_buffer = bytesread;
+        goto out;
     }
 
-    /* if the poll reports errors for any reason at all
-     * including a timeout, or there is a read error,
-     * we skip the turn.
+    /* if the poll reports errors for any reason at all,
+     * including a timeout, we skip the turn.
      */
 
     block_Release(pkt);
